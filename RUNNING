@@ -1,0 +1,21 @@
+- DPDK is installed globally (version: 23.11)
+
+- These environment variables are set:
+	CLIENT_IPV4_ADDR=192.168.1.2:50123
+	NET_IFACE=ens1f1np1
+	WORKDIR=/users/farbod/demi
+	CONFIG_PATH=/users/farbod/demi/config.yaml
+	SERVER_IPV4_ADDR=192.168.1.1:8080
+	LIBOS=catnap
+
+- Only the DPDK(catnip) LIBOS was compiled so it is possible that other modes
+  do not work. I have included the library in this repository. The library was
+  built on a x86_64 little endian cpu.
+
+
+- The following command should make it run
+
+```
+make
+./build/tcp-ping-pong.elf --client 192.168.1.1 8080
+```
