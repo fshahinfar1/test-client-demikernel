@@ -6,64 +6,28 @@
 // See https://man7.org/linux/man-pages/man7/feature_test_macros.7.html.
 #define _POSIX_C_SOURCE 200809L
 
-/*====================================================================================================================*
- * Imports                                                                                                            *
- *====================================================================================================================*/
-
 #include <assert.h>
-#include <demi/libos.h>
-#include <demi/sga.h>
-#include <demi/wait.h>
 #include <string.h>
-
-#ifdef __linux__
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#endif
+
+#include "demi/libos.h"
+#include "demi/sga.h"
+#include "demi/wait.h"
 
 #include "common.h"
 
-/*====================================================================================================================*
- * Constants                                                                                                          *
- *====================================================================================================================*/
-
-/**
- * @brief Data size.
- */
 #define DATA_SIZE 64
+#define MAX_MSGS  (1024*1024)
 
-/**
- * @brief Maximum number of messages to transfer.
- */
-#define MAX_MSGS 1024
-
-/*====================================================================================================================*
- * accept_wait()                                                                                                      *
- *====================================================================================================================*/
-
-/**
- * @brief Accepts a connection on a socket and waits for operation to complete.
- *
- * @param qd Target queue descriptor.
- *
- * @returns On successful completion, a queue descriptor for an accepted connection is returned. On failure, this
- * function aborts the program execution.
- */
-static int accept_wait(int qd)
-{
-    demi_qtoken_t qt = -1;
-    demi_qresult_t qr = {0};
-
-    /* Accept a connection. */
-    assert(demi_accept(&qt, qd) == 0);
-
-    /* Wait for operation to complete. */
-    assert(demi_wait(&qr, qt, NULL) == 0);
-
-    /* Parse operation result. */
-    assert(qr.qr_opcode == DEMI_OPC_ACCEPT);
-
-    return (qr.qr_value.ares.qd);
+#include <sys/types.h>
+#include <x86intrin.h>
+static inline
+time_t read_tsc(void) {
+	_mm_lfence();  // optionally wait for earlier insns to retire before reading the clock
+	time_t tsc = __rdtsc();
+	_mm_lfence();  // optionally block later instructions until rdtsc retires
+	return tsc;
 }
 
 /*====================================================================================================================*
@@ -78,17 +42,17 @@ static int accept_wait(int qd)
  */
 static void connect_wait(int qd, const struct sockaddr_in *saddr)
 {
-    demi_qtoken_t qt = -1;
-    demi_qresult_t qr = {0};
+	demi_qtoken_t qt = -1;
+	demi_qresult_t qr = {0};
 
-    /* Connect to remote */
-    assert(demi_connect(&qt, qd, (const struct sockaddr *)saddr, sizeof(struct sockaddr_in)) == 0);
+	/* Connect to remote */
+	assert(demi_connect(&qt, qd, (const struct sockaddr *)saddr, sizeof(struct sockaddr_in)) == 0);
 
-    /* Wait for operation to complete. */
-    assert(demi_wait(&qr, qt, NULL) == 0);
+	/* Wait for operation to complete. */
+	assert(demi_wait(&qr, qt, NULL) == 0);
 
-    /* Parse operation result. */
-    assert(qr.qr_opcode == DEMI_OPC_CONNECT);
+	/* Parse operation result. */
+	assert(qr.qr_opcode == DEMI_OPC_CONNECT);
 }
 
 /*====================================================================================================================*
@@ -104,16 +68,16 @@ static void connect_wait(int qd, const struct sockaddr_in *saddr)
  */
 static void push_wait(int qd, demi_sgarray_t *sga, demi_qresult_t *qr)
 {
-    demi_qtoken_t qt = -1;
+	demi_qtoken_t qt = -1;
 
-    /* Push data. */
-    assert(demi_push(&qt, qd, sga) == 0);
+	/* Push data. */
+	assert(demi_push(&qt, qd, sga) == 0);
 
-    /* Wait push operation to complete. */
-    assert(demi_wait(qr, qt, NULL) == 0);
+	/* Wait push operation to complete. */
+	assert(demi_wait(qr, qt, NULL) == 0);
 
-    /* Parse operation result. */
-    assert(qr->qr_opcode == DEMI_OPC_PUSH);
+	/* Parse operation result. */
+	assert(qr->qr_opcode == DEMI_OPC_PUSH);
 }
 
 /*====================================================================================================================*
@@ -128,72 +92,27 @@ static void push_wait(int qd, demi_sgarray_t *sga, demi_qresult_t *qr)
  */
 static void pop_wait(int qd, demi_qresult_t *qr)
 {
-    demi_qtoken_t qt = -1;
+	demi_qtoken_t qt = -1;
 
-    /* Pop data. */
-    assert(demi_pop(&qt, qd) == 0);
+	/* Pop data. */
+	assert(demi_pop(&qt, qd) == 0);
 
-    /* Wait for pop operation to complete. */
-    assert(demi_wait(qr, qt, NULL) == 0);
+	/* Wait for pop operation to complete. */
+	assert(demi_wait(qr, qt, NULL) == 0);
 
-    /* Parse operation result. */
-    assert(qr->qr_opcode == DEMI_OPC_POP);
-    assert(qr->qr_value.sga.sga_segs != 0);
+	/* Parse operation result. */
+	assert(qr->qr_opcode == DEMI_OPC_POP);
+	assert(qr->qr_value.sga.sga_segs != 0);
 }
 
-/*====================================================================================================================*
- * server()                                                                                                           *
- *====================================================================================================================*/
 
-/**
- * @brief TCP echo server.
- *
- * @param argc  Argument count.
- * @param argv  Argument list.
- * @param local Local socket address.
- * @param data_size Number of bytes in each message.
- * @param max_msgs Maximum number of messages to transfer.
- */
-static void server(int argc, char *const argv[], struct sockaddr_in *local, size_t data_size, unsigned max_msgs)
+static void report_measurements(uint64_t *m, size_t count)
 {
-    int qd = -1;
-    size_t nbytes = 0;
-    int sockqd = -1;
-    size_t max_bytes = data_size * max_msgs;
-
-    /* Initialize demikernel */
-    assert(demi_init(argc, argv) == 0);
-
-    /* Setup local socket. */
-    assert(demi_socket(&sockqd, AF_INET, SOCK_STREAM, 0) == 0);
-    assert(demi_bind(sockqd, (const struct sockaddr *)local, sizeof(struct sockaddr_in)) == 0);
-    assert(demi_listen(sockqd, 16) == 0);
-
-    /* Accept client . */
-    qd = accept_wait(sockqd);
-
-    /* Run. */
-    while (nbytes < max_bytes)
-    {
-        demi_qresult_t qr = {0};
-        demi_sgarray_t sga = {0};
-
-        /* Pop scatter-gather array. */
-        pop_wait(qd, &qr);
-
-        /* Extract received scatter-gather array. */
-        memcpy(&sga, &qr.qr_value.sga, sizeof(demi_sgarray_t));
-
-        nbytes += sga.sga_segs[0].sgaseg_len;
-
-        /* Push scatter-gather array. */
-        push_wait(qd, &sga, &qr);
-
-        /* Release received scatter-gather array. */
-        assert(demi_sgafree(&sga) == 0);
-
-        fprintf(stdout, "ping (%zu)\n", nbytes);
-    }
+	printf("-------------------------------------\n");
+	for (size_t i = 0; i < count; i++) {
+		printf("%ld\n", m[i]);
+	}
+	printf("-------------------------------------\n");
 }
 
 /*====================================================================================================================*
@@ -211,52 +130,57 @@ static void server(int argc, char *const argv[], struct sockaddr_in *local, size
  */
 static void client(int argc, char *const argv[], const struct sockaddr_in *remote, size_t data_size, unsigned max_msgs)
 {
-    size_t nbytes = 0;
-    int sockqd = -1;
-    size_t max_bytes = data_size * max_msgs;
+	size_t nbytes = 0;
+	int sockqd = -1;
+	size_t max_bytes = data_size * max_msgs;
+	uint64_t *measurments = calloc(MAX_MSGS + 100, sizeof(uint64_t));
+	size_t m_index = 0;
+	time_t before, after;
 
-    /* Initialize demikernel */
-    assert(demi_init(argc, argv) == 0);
+	/* Initialize demikernel */
+	assert(demi_init(argc, argv) == 0);
 
-    /* Setup socket. */
-    assert(demi_socket(&sockqd, AF_INET, SOCK_STREAM, 0) == 0);
+	/* Setup socket. */
+	assert(demi_socket(&sockqd, AF_INET, SOCK_STREAM, 0) == 0);
 
-    /* Connect to server. */
-    connect_wait(sockqd, remote);
+	/* Connect to server. */
+	connect_wait(sockqd, remote);
 
-    /* Run. */
-    while (nbytes < max_bytes)
-    {
-        demi_qresult_t qr = {0};
-        demi_sgarray_t sga = {0};
+	/* Run. */
+	while (nbytes < max_bytes)
+	{
+		demi_qresult_t qr = {0};
+		demi_sgarray_t sga = {0};
 
-        /* Allocate scatter-gather array. */
-        sga = demi_sgaalloc(data_size);
-        assert(sga.sga_segs != 0);
+		/* Allocate scatter-gather array. */
+		sga = demi_sgaalloc(data_size);
+		assert(sga.sga_segs != 0);
 
-        /* Cook data. */
-        memset(sga.sga_segs[0].sgaseg_buf, 1, data_size);
+		/* Cook data. */
+		memset(sga.sga_segs[0].sgaseg_buf, 0xAB, data_size);
 
-        /* Push scatter-gather array. */
-        push_wait(sockqd, &sga, &qr);
+		before = read_tsc();
+		/* Push scatter-gather array. */
+		push_wait(sockqd, &sga, &qr);
 
-        /* Release sent scatter-gather array. */
-        assert(demi_sgafree(&sga) == 0);
+		/* Release sent scatter-gather array. */
+		assert(demi_sgafree(&sga) == 0);
 
-        /* Pop data scatter-gather array. */
-        memset(&qr, 0, sizeof(demi_qresult_t));
-        pop_wait(sockqd, &qr);
+		/* Pop data scatter-gather array. */
+		memset(&qr, 0, sizeof(demi_qresult_t));
+		pop_wait(sockqd, &qr);
+		after = read_tsc();
+		measurments[m_index] = after - before;
+		m_index++;
 
-        /* Check payload. */
-        for (uint32_t i = 0; i < qr.qr_value.sga.sga_segs[0].sgaseg_len; i++)
-            assert(((char *)qr.qr_value.sga.sga_segs[0].sgaseg_buf)[i] == 1);
-        nbytes += qr.qr_value.sga.sga_segs[0].sgaseg_len;
+		nbytes += qr.qr_value.sga.sga_segs[0].sgaseg_len;
 
-        /* Release received scatter-gather array. */
-        assert(demi_sgafree(&qr.qr_value.sga) == 0);
+		/* Release received scatter-gather array. */
+		assert(demi_sgafree(&qr.qr_value.sga) == 0);
 
-        fprintf(stdout, "pong (%zu)\n", nbytes);
-    }
+		/* fprintf(stdout, "pong (%zu)\n", nbytes); */
+	}
+	report_measurements(measurments, m_index);
 }
 
 /*====================================================================================================================*
@@ -270,10 +194,7 @@ static void client(int argc, char *const argv[], const struct sockaddr_in *remot
  */
 static void usage(const char *progname)
 {
-    fprintf(stderr, "Usage: %s MODE ipv4-address port\n", progname);
-    fprintf(stderr, "MODE:\n");
-    fprintf(stderr, "  --client    Run in client mode.\n");
-    fprintf(stderr, "  --server    Run in server mode.\n");
+	fprintf(stderr, "Usage: %s ipv4-address port\n", progname);
 }
 
 /*====================================================================================================================*
@@ -289,57 +210,45 @@ static void usage(const char *progname)
  */
 void build_sockaddr(const char *const ip_str, const char *const port_str, struct sockaddr_in *const addr)
 {
-    int port = -1;
+	int port = -1;
 
-    sscanf(port_str, "%d", &port);
-    addr->sin_family = AF_INET;
-    addr->sin_port = htons(port);
-    assert(inet_pton(AF_INET, ip_str, &addr->sin_addr) == 1);
+	sscanf(port_str, "%d", &port);
+	addr->sin_family = AF_INET;
+	addr->sin_port = htons(port);
+	assert(inet_pton(AF_INET, ip_str, &addr->sin_addr) == 1);
 }
 
 /*====================================================================================================================*
  * main()                                                                                                             *
  *====================================================================================================================*/
 
-/**
- * @brief Exercises a one-way direction communication through UDP.
- *
- * This system-level test instantiates two demikernel nodes: a client and a server. The client sends UDP packets to the
- * server in a tight loop. The server process in a tight loop received UDP packets from the client.
- *
- * @param argc Argument count.
- * @param argv Argument list.
- *
- * @return On successful completion EXIT_SUCCESS is returned.
- */
 int main(int argc, char *const argv[])
 {
-    if (argc >= 4)
-    {
-        reg_sighandlers();
+	if (argc >= 3)
+	{
+		reg_sighandlers();
 
-        struct sockaddr_in saddr = {0};
-        size_t data_size = DATA_SIZE;
-        unsigned max_msgs = MAX_MSGS;
+		struct sockaddr_in saddr = {0};
+		size_t data_size = DATA_SIZE;
+		unsigned max_msgs = MAX_MSGS;
 
-        if (argc >= 5)
-            sscanf(argv[4], "%zu", &data_size);
-        if (argc >= 6)
-            sscanf(argv[5], "%u", &max_msgs);
+		if (argc >= 4)
+			sscanf(argv[3], "%zu", &data_size);
+		if (argc >= 5)
+			sscanf(argv[4], "%u", &max_msgs);
 
-        /* Build addresses.*/
-        build_sockaddr(argv[2], argv[3], &saddr);
+		/* The server that I work with require this space */
+		assert (data_size > 16);
+		/* Build addresses.*/
+		build_sockaddr(argv[1], argv[2], &saddr);
 
-        /* Run. */
-        if (!strcmp(argv[1], "--server"))
-            server(argc, argv, &saddr, data_size, max_msgs);
-        else if (!strcmp(argv[1], "--client"))
-            client(argc, argv, &saddr, data_size, max_msgs);
+		/* Run. */
+		client(argc, argv, &saddr, data_size, max_msgs);
 
-        return (EXIT_SUCCESS);
-    }
+		return (EXIT_SUCCESS);
+	}
 
-    usage(argv[0]);
+	usage(argv[0]);
 
-    return (EXIT_SUCCESS);
+	return (EXIT_SUCCESS);
 }

@@ -10,7 +10,7 @@ INCDIR := ./include/
 LIBS := ./libdemikernel.so
 BINDIR := ./build
 CC := gcc
-CFLAGS := -Werror -Wall -Wextra -O3 -I $(INCDIR) -std=c99
+CFLAGS := -Wall -Wextra -O3 -I $(INCDIR) -std=c99
 
 #=======================================================================================================================
 # Build Artifacts
